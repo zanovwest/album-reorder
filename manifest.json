@@ -1,0 +1,8 @@
+{
+	"name": "Album Reorder",
+	"description": "Drag tracks on an album page to give the album your own track order. The album page shows it and playback follows it.",
+	"preview": "preview.png",
+	"main": "albumReorder.js",
+	"readme": "README.md",
+	"tags": ["album", "tracklist", "reorder", "playback", "queue"]
+}
