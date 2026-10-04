@@ -1,31 +1,35 @@
 // NAME: Album Reorder
 // DESCRIPTION: Drag tracks on an album page to give the album your own track order. The album page shows it and playback follows it.
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 
 /// <reference path="../globals.d.ts" />
 
 (function albumReorder() {
-	if (
-		!Spicetify?.Platform?.PlayerAPI ||
-		!Spicetify.Platform.History ||
-		!Spicetify.GraphQL?.Definitions?.queryAlbumTracks ||
-		!Spicetify.LocalStorage ||
-		!document.body
-	) {
+	if (!Spicetify?.Platform?.PlayerAPI || !Spicetify.Platform.History || !Spicetify.LocalStorage || !document.body) {
 		setTimeout(albumReorder, 300);
 		return;
 	}
 
 	const LOG = "[album-reorder]";
 	const STORAGE_KEY = "album-reorder:orders";
-	const GRID_SELECTOR = '[data-testid="album-page"] [role="grid"]';
+	// Newest Spotify layout first; later entries cover older builds.
+	const GRID_SELECTORS = ['[data-testid="album-page"] [role="grid"]', '.main-view-container [role="grid"]', '[data-testid="track-list"]'];
+	const ACTION_BAR_SELECTORS = [
+		'[data-testid="album-page"] [data-testid="action-bar-row"]',
+		'.main-view-container [data-testid="action-bar-row"]',
+		".main-actionBar-ActionBarRow",
+	];
 	const DROP_ATTR = "data-album-reorder-drop";
 	const FORCED_ATTR = "data-album-reorder-forced";
 	const RESET_ID = "album-reorder-reset";
 	const TOAST_ID = "album-reorder-toast";
 	const DELIMITER = "spotify:delimiter";
-	// The album page loads 50 tracks at a time; longer albums can't be shown reordered.
-	const MAX_TRACKS = 50;
+	// Rewritten album data keeps each track's real position here: { disc, number }.
+	const ORIGINAL_KEY = "albumReorderOriginal";
+	// Spotify keeps ~80 upcoming tracks loaded. Keep the next QUEUE_CHECK in the custom order,
+	// refilling up to QUEUE_WINDOW at a time.
+	const QUEUE_CHECK = 20;
+	const QUEUE_WINDOW = 60;
 	const playerApi = Spicetify.Platform.PlayerAPI;
 
 	// ---------------------------------------------------------------------------
@@ -48,7 +52,7 @@
 	}
 
 	function getEntry(albumUri) {
-		const entry = albumUri ? orders[albumUri] : null;
+		const entry = typeof albumUri === "string" ? orders[albumUri] : null;
 		return entry && Array.isArray(entry.order) && Array.isArray(entry.original) ? entry : null;
 	}
 
@@ -91,7 +95,8 @@
 			const bucket = buckets.get(uri);
 			if (bucket?.length) out.push(bucket.shift());
 		}
-		for (const item of items) if (!out.includes(item)) out.push(item);
+		const placed = new Set(out);
+		for (const item of items) if (!placed.has(item)) out.push(item);
 		return out.length === items.length ? out : null;
 	}
 
@@ -104,9 +109,28 @@
 		return albumUriFromPath(Spicetify.Platform.History.location?.pathname);
 	}
 
+	function findFirst(selectors) {
+		for (const selector of selectors) {
+			const el = document.querySelector(selector);
+			if (el) return el;
+		}
+		return null;
+	}
+
+	function findAlbumGrid() {
+		return currentAlbumUri() ? findFirst(GRID_SELECTORS) : null;
+	}
+
 	function reactFiber(el) {
-		const key = el && Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
+		const key = el && Object.keys(el).find((k) => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
 		return key ? el[key] : null;
+	}
+
+	function scrollParent(el) {
+		for (let node = el?.parentElement; node; node = node.parentElement) {
+			if (/(auto|scroll)/.test(getComputedStyle(node).overflowY) && node.scrollHeight > node.clientHeight) return node;
+		}
+		return null;
 	}
 
 	// Spicetify.showNotification isn't available on every Spotify version, so fall back to our own toast.
@@ -138,33 +162,60 @@
 
 	const trackCache = new Map();
 
+	async function fetchTracksGraphQL(albumUri) {
+		const query = Spicetify.GraphQL?.Definitions?.queryAlbumTracks;
+		if (!query || typeof Spicetify.GraphQL.Request !== "function") return null;
+		const tracks = [];
+		let rewritten = false;
+		for (let offset = 0; ; ) {
+			const { data, errors } = await Spicetify.GraphQL.Request(query, { uri: albumUri, offset, limit: 100 });
+			if (errors?.length) throw new Error(errors[0].message);
+			const list = data?.albumUnion?.tracksV2 ?? data?.albumUnion?.tracks;
+			const items = list?.items ?? [];
+			for (const { track } of items) {
+				const original = track[ORIGINAL_KEY];
+				rewritten ||= !!original;
+				tracks.push({
+					uri: track.uri,
+					name: track.name,
+					disc: original?.disc ?? track.discNumber ?? 1,
+					number: original?.number ?? track.trackNumber ?? 0,
+					playable: track.playability?.playable !== false,
+				});
+			}
+			offset += items.length;
+			if (!items.length || offset >= (list?.totalCount ?? 0)) break;
+		}
+		// Our fetch hook may have served this in the custom order; put it back in album order.
+		if (rewritten) tracks.sort((a, b) => a.disc - b.disc || a.number - b.number);
+		return tracks;
+	}
+
+	async function fetchTracksWebApi(albumUri) {
+		if (typeof Spicetify.CosmosAsync?.get !== "function") return null;
+		const id = albumUri.split(":").pop();
+		const tracks = [];
+		for (let offset = 0; ; offset += 50) {
+			const page = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/albums/${id}/tracks?limit=50&offset=${offset}`);
+			for (const t of page?.items ?? []) {
+				tracks.push({ uri: t.uri, name: t.name, disc: t.disc_number ?? 1, number: t.track_number ?? 0, playable: t.is_playable !== false });
+			}
+			if (!page?.next) break;
+		}
+		return tracks;
+	}
+
 	function getAlbumTracks(albumUri) {
 		if (trackCache.has(albumUri)) return trackCache.get(albumUri);
 		const promise = (async () => {
-			const tracks = [];
-			for (let offset = 0; ; ) {
-				const { data, errors } = await Spicetify.GraphQL.Request(Spicetify.GraphQL.Definitions.queryAlbumTracks, {
-					uri: albumUri,
-					offset,
-					limit: 100,
-				});
-				if (errors?.length) throw new Error(errors[0].message);
-				const list = data?.albumUnion?.tracksV2 ?? data?.albumUnion?.tracks;
-				const items = list?.items ?? [];
-				for (const { uid, track } of items) {
-					tracks.push({
-						uri: track.uri,
-						uid: uid ?? "",
-						name: track.name,
-						disc: track.discNumber ?? 1,
-						number: track.trackNumber,
-						playable: track.playability?.playable !== false,
-					});
-				}
-				offset += items.length;
-				if (!items.length || offset >= (list?.totalCount ?? 0)) break;
+			let tracks = null;
+			try {
+				tracks = await fetchTracksGraphQL(albumUri);
+			} catch (err) {
+				console.warn(LOG, "GraphQL track lookup failed, trying the Web API", err);
 			}
-			if (!tracks.length) throw new Error("Couldn't load this album's tracks");
+			if (!tracks?.length) tracks = await fetchTracksWebApi(albumUri);
+			if (!tracks?.length) throw new Error("Couldn't load this album's tracks");
 			return tracks;
 		})();
 		trackCache.set(albumUri, promise);
@@ -173,31 +224,66 @@
 	}
 
 	// ---------------------------------------------------------------------------
-	// Album page: serve Spotify's own getAlbum data in the custom order
+	// Album data: serve every list of an album's tracks in the custom order
 	// ---------------------------------------------------------------------------
 
-	function collapseRawDiscs(discs, count) {
-		if (!discs?.items?.length) return discs;
-		const first = discs.items[0];
-		return { ...discs, totalCount: 1, items: [{ ...first, number: 1, tracks: { ...(first.tracks ?? {}), totalCount: count } }] };
+	function albumTrackList(json) {
+		const album = json?.data?.albumUnion;
+		const list = album?.tracksV2 ?? album?.tracks;
+		const items = list?.items;
+		return Array.isArray(items) && items.length && items.every((it) => typeof it?.track?.uri === "string") ? list : null;
 	}
 
-	function rewriteRawAlbum(json, entry) {
-		const album = json?.data?.albumUnion;
-		const key = album?.tracksV2 ? "tracksV2" : album?.tracks ? "tracks" : null;
-		const list = key && album[key];
-		const items = list?.items;
-		// Only whole albums (Spotify loads 50 tracks per page).
-		if (!Array.isArray(items) || items.length < (list.totalCount ?? items.length)) return false;
-		const sorted = applyOrder(items, (it) => it?.track?.uri, entry.order);
+	// Long albums come in pages. Fetch the whole album by replaying the same request page by page.
+	const fullAlbumCache = new Map(); // `${operation}|${albumUri}` -> { time, promise }
+
+	function allAlbumItems(albumUri, request, input, init, firstPage) {
+		const key = `${request.operationName}|${albumUri}`;
+		const cached = fullAlbumCache.get(key);
+		if (cached && Date.now() - cached.time < 60000) return cached.promise;
+		const promise = (async () => {
+			const total = firstPage.totalCount ?? 0;
+			const pageSize = Math.max(Number(request.variables.limit) || 0, firstPage.items.length, 1);
+			const items = [];
+			for (let offset = 0; offset < total; offset += pageSize) {
+				const body = JSON.stringify({ ...request, variables: { ...request.variables, offset, limit: pageSize } });
+				const response = await originalFetch.call(window, input, { ...init, body });
+				if (!response.ok) throw new Error(`HTTP ${response.status}`);
+				const list = albumTrackList(await response.json());
+				if (!list) break;
+				items.push(...list.items);
+			}
+			return items;
+		})();
+		fullAlbumCache.set(key, { time: Date.now(), promise });
+		promise.catch(() => fullAlbumCache.delete(key));
+		return promise;
+	}
+
+	function renumber(item, number) {
+		const track = item.track;
+		const original = track[ORIGINAL_KEY] ?? { disc: track.discNumber, number: track.trackNumber };
+		const numbers = "trackNumber" in track ? { trackNumber: number, discNumber: 1 } : {};
+		return { ...item, track: { ...track, ...numbers, [ORIGINAL_KEY]: original } };
+	}
+
+	async function reorderAlbumResponse(json, request, input, init) {
+		const albumUri = request.variables?.uri;
+		const entry = getEntry(albumUri);
+		const page = entry && albumTrackList(json);
+		if (!page) return false;
+		const offset = Number(request.variables.offset) || 0;
+		const total = page.totalCount ?? page.items.length;
+		const all = offset === 0 && page.items.length >= total ? page.items : await allAlbumItems(albumUri, request, input, init, page);
+		if (!all || all.length < total) return false;
+		const sorted = applyOrder(all, (it) => it.track.uri, entry.order);
 		if (!sorted) return false;
-		sorted.forEach((it, i) => {
-			if (!it.track) return;
-			it.track.trackNumber = i + 1;
-			it.track.discNumber = 1;
-		});
-		list.items = sorted;
-		album.discs = collapseRawDiscs(album.discs, sorted.length);
+		page.items = sorted.slice(offset, offset + page.items.length).map((it, i) => renumber(it, offset + i + 1));
+		const album = json.data.albumUnion;
+		if (album.discs?.items?.length) {
+			const first = album.discs.items[0];
+			album.discs = { ...album.discs, totalCount: 1, items: [{ ...first, number: 1, tracks: { ...(first.tracks ?? {}), totalCount: total } }] };
+		}
 		return true;
 	}
 
@@ -206,13 +292,11 @@
 		const response = await originalFetch.apply(window, arguments);
 		try {
 			const body = init?.body;
-			if (typeof body !== "string" || !body.includes('"getAlbum"') || !response.ok) return response;
+			if (typeof body !== "string" || !response.ok || !body.includes("spotify:album:")) return response;
 			const request = JSON.parse(body);
-			if (request?.operationName !== "getAlbum" || (request.variables?.offset ?? 0) !== 0) return response;
-			const entry = getEntry(request.variables?.uri);
-			if (!entry) return response;
+			if (!getEntry(request?.variables?.uri)) return response;
 			const json = await response.clone().json();
-			if (!rewriteRawAlbum(json, entry)) return response;
+			if (!(await reorderAlbumResponse(json, request, input, init))) return response;
 			const headers = new Headers(response.headers);
 			headers.delete("content-length");
 			headers.delete("content-encoding");
@@ -223,12 +307,16 @@
 		}
 	};
 
+	// ---------------------------------------------------------------------------
+	// Album page: show a new order straight away
+	// ---------------------------------------------------------------------------
+
 	// Spotify keeps album pages in a TanStack Query cache; updating it re-renders the page instantly.
 	let queryClient = null;
 
 	function findQueryClient() {
 		if (queryClient) return queryClient;
-		const start = document.querySelector(GRID_SELECTOR) ?? document.querySelector(".main-view-container") ?? document.querySelector("#main");
+		const start = findAlbumGrid() ?? findFirst([".main-view-container", "#main", "body > div"]);
 		for (let fiber = reactFiber(start), i = 0; fiber && i < 3000; fiber = fiber.return, i++) {
 			const props = fiber.memoizedProps;
 			const client = props?.client ?? props?.value;
@@ -240,42 +328,57 @@
 		return null;
 	}
 
-	// Puts Spotify's album model (the cached getAlbum result) in `order`. Pass `originalTracks`
-	// when restoring the original order so the real track and disc numbers come back.
+	function albumPageQuery(albumUri) {
+		return (query) => query.queryKey?.[0] === "getAlbum" && query.queryKey?.[1]?.uri === albumUri;
+	}
+
+	function anyAlbumQuery(albumUri) {
+		return (query) => query.queryKey?.[1]?.uri === albumUri;
+	}
+
+	// Puts Spotify's album model (the cached getAlbum result) in `order`, shaped the way Spotify builds
+	// it: multi-disc albums list an { type: "AlbumDisc" } header before each disc's tracks; a custom
+	// order is one disc with no headers. Pass `originalTracks` when restoring the original order so
+	// the real track numbers and disc headers come back.
 	function albumModelInOrder(model, order, originalTracks) {
 		if (!model || !Array.isArray(model.items)) return null;
-		if (typeof model.nrTracks === "number" && model.items.length < model.nrTracks) return null;
-		const sorted = applyOrder(model.items, (it) => it?.uri, order);
+		const tracks = model.items.filter((it) => typeof it?.uri === "string");
+		if (typeof model.nrTracks === "number" && tracks.length < model.nrTracks) return null;
+		const sorted = applyOrder(tracks, (it) => it.uri, order);
 		if (!sorted) return null;
 		const discTemplate = model.discs?.items?.[0] ?? { type: "AlbumDisc" };
+		const disc = (discNumber, nrTracks) => ({ ...discTemplate, discNumber, nrTracks });
 
 		if (!originalTracks) {
-			const discs = model.discs ? { ...model.discs, totalCount: 1, items: [{ ...discTemplate, discNumber: 1, nrTracks: sorted.length }] } : model.discs;
+			const discs = model.discs ? { ...model.discs, totalCount: 1, items: [disc(1, sorted.length)] } : model.discs;
 			return { ...model, items: sorted.map((it, i) => ({ ...it, trackNumber: i + 1, discNumber: 1 })), discs };
 		}
 
 		const info = new Map(originalTracks.map((t) => [t.uri, t]));
-		const items = sorted.map((it) => {
+		const renumbered = sorted.map((it) => {
 			const track = info.get(it.uri);
 			return track ? { ...it, trackNumber: track.number, discNumber: track.disc } : it;
 		});
 		const perDisc = new Map();
-		for (const it of items) perDisc.set(it.discNumber ?? 1, (perDisc.get(it.discNumber ?? 1) ?? 0) + 1);
-		const discs = model.discs
-			? { ...model.discs, totalCount: perDisc.size, items: [...perDisc].map(([discNumber, nrTracks]) => ({ ...discTemplate, discNumber, nrTracks })) }
-			: model.discs;
+		for (const it of renumbered) perDisc.set(it.discNumber ?? 1, (perDisc.get(it.discNumber ?? 1) ?? 0) + 1);
+		const multiDisc = perDisc.size > 1;
+		const items = [];
+		let currentDisc = null;
+		for (const it of renumbered) {
+			if (multiDisc && it.discNumber !== currentDisc) {
+				currentDisc = it.discNumber;
+				items.push(disc(currentDisc, perDisc.get(currentDisc)));
+			}
+			items.push(it);
+		}
+		const discs = model.discs ? { ...model.discs, totalCount: perDisc.size, items: [...perDisc].map(([n, count]) => disc(n, count)) } : model.discs;
 		return { ...model, items, discs };
-	}
-
-	function albumQueryPredicate(albumUri) {
-		return (query) => query.queryKey?.[0] === "getAlbum" && query.queryKey?.[1]?.uri === albumUri;
 	}
 
 	// The album tracklist copies its tracks into its own item cache: { items: [{ value, index }] },
 	// re-rendered through a counter state. Returns those two, or null if the shape isn't recognised.
 	function findTracklistCache() {
-		const grid = document.querySelector(GRID_SELECTOR);
-		for (let fiber = reactFiber(grid), i = 0; fiber && i < 40; fiber = fiber.return, i++) {
+		for (let fiber = reactFiber(findAlbumGrid()), i = 0; fiber && i < 40; fiber = fiber.return, i++) {
 			const props = fiber.memoizedProps;
 			if (!Array.isArray(props?.tracks) || typeof props.fetchTracks !== "function") continue;
 			let cache = null;
@@ -300,12 +403,11 @@
 	let resyncTimes = [];
 
 	function syncMountedTracklist(albumUri, force = false) {
-		if (currentAlbumUri() !== albumUri || !document.querySelector(GRID_SELECTOR)) return true;
+		if (currentAlbumUri() !== albumUri || !findAlbumGrid()) return true;
 		const list = findTracklistCache();
-		const client = findQueryClient();
-		const items = client
+		const items = findQueryClient()
 			?.getQueryCache()
-			.findAll({ predicate: albumQueryPredicate(albumUri) })
+			.findAll({ predicate: albumPageQuery(albumUri) })
 			.map((query) => query.state.data?.items)
 			.find((candidate) => Array.isArray(candidate) && candidate.length === list?.slots.length);
 		if (!list || !items) return false;
@@ -327,27 +429,48 @@
 		return true;
 	}
 
+	// Fallback for long albums and Spotify builds we can't update in place: briefly leave the page
+	// and come back, so it loads again (through the fetch hook), then restore the scroll position.
+	function remountAlbumPage() {
+		const history = Spicetify.Platform.History;
+		const location = history.location;
+		const scrollTop = scrollParent(findAlbumGrid())?.scrollTop ?? 0;
+		history.replace("/search");
+		setTimeout(() => {
+			history.replace(location);
+			let tries = 0;
+			const restore = () => {
+				const scroller = scrollParent(findAlbumGrid());
+				if (scroller && scroller.scrollHeight - scroller.clientHeight >= scrollTop) scroller.scrollTop = scrollTop;
+				else if (++tries < 50) setTimeout(restore, 100);
+			};
+			restore();
+		}, 50);
+	}
+
 	function refreshAlbumPage(albumUri, tracks) {
-		const client = findQueryClient();
-		if (!client) return false;
 		touchedAlbums.add(albumUri);
-		const predicate = albumQueryPredicate(albumUri);
-		const entry = getEntry(albumUri);
-		const order = entry ? entry.order : tracks.map((t) => t.uri);
-		let updatedAny = false;
-		let complete = true;
-		for (const query of client.getQueryCache().findAll({ predicate })) {
-			const updated = albumModelInOrder(query.state.data, order, entry ? null : tracks);
-			if (!updated) {
-				complete = false;
-				continue;
+		const onPage = currentAlbumUri() === albumUri;
+		const client = findQueryClient();
+		if (client) {
+			const entry = getEntry(albumUri);
+			const order = entry ? entry.order : tracks.map((t) => t.uri);
+			let complete = true;
+			let updated = false;
+			for (const query of client.getQueryCache().findAll({ predicate: albumPageQuery(albumUri) })) {
+				const model = albumModelInOrder(query.state.data, order, entry ? null : tracks);
+				if (!model) {
+					complete = false;
+					continue;
+				}
+				client.setQueryData(query.queryKey, model);
+				updated = true;
 			}
-			client.setQueryData(query.queryKey, updated);
-			updatedAny = true;
+			if (complete && (!onPage || (updated && syncMountedTracklist(albumUri, true)))) return;
+			// Drop the cached copies so the page loads the album again, in the right order.
+			client.removeQueries({ predicate: anyAlbumQuery(albumUri) });
 		}
-		// Anything we couldn't update in place gets refetched through the fetch hook above.
-		if (!complete) client.invalidateQueries({ predicate });
-		return updatedAny ? syncMountedTracklist(albumUri, true) : complete;
+		if (onPage) remountAlbumPage();
 	}
 
 	// ---------------------------------------------------------------------------
@@ -365,7 +488,7 @@
 			right: 0;
 			height: 2px;
 			border-radius: 1px;
-			background: var(--text-bright-accent, #1ed760);
+			background: var(--text-bright-accent, var(--spice-button, #1ed760));
 			pointer-events: none;
 			z-index: 2;
 		}
@@ -378,17 +501,17 @@
 			height: 32px;
 			padding: 0 15px;
 			margin-inline-start: 8px;
-			border: 1px solid var(--essential-subdued, #7c7c7c);
+			border: 1px solid var(--essential-subdued, var(--spice-subtext, #7c7c7c));
 			border-radius: 9999px;
 			background: transparent;
-			color: var(--text-base, #fff);
+			color: var(--text-base, var(--spice-text, #fff));
 			font-family: inherit;
 			font-size: 0.875rem;
 			font-weight: 700;
 			white-space: nowrap;
 			cursor: pointer;
 		}
-		#${RESET_ID}:hover { border-color: var(--text-base, #fff); transform: scale(1.04); }
+		#${RESET_ID}:hover { border-color: var(--text-base, var(--spice-text, #fff)); transform: scale(1.04); }
 		#${RESET_ID}:active { transform: scale(1); opacity: 0.7; }
 
 		#${TOAST_ID} {
@@ -399,8 +522,8 @@
 			max-width: min(480px, calc(100vw - 32px));
 			padding: 10px 16px;
 			border-radius: 8px;
-			background: var(--text-base, #fff);
-			color: var(--background-base, #121212);
+			background: var(--text-base, var(--spice-text, #fff));
+			color: var(--background-base, var(--spice-main, #121212));
 			font-size: 0.875rem;
 			box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
 			opacity: 0;
@@ -418,16 +541,16 @@
 
 	function rowTrackUri(row) {
 		for (let fiber = reactFiber(row.firstElementChild ?? row), i = 0; fiber && i < 30; fiber = fiber.return, i++) {
-			const uri = fiber.memoizedProps?.uri;
+			const props = fiber.memoizedProps;
+			const uri = props?.uri ?? props?.track?.uri ?? props?.item?.uri;
 			if (typeof uri === "string" && /^spotify:(track|local):/.test(uri)) return uri;
 		}
 		return null;
 	}
 
 	function trackRowAt(target) {
-		if (!(target instanceof Element)) return {};
-		const grid = target.closest(GRID_SELECTOR);
-		if (!grid) return {};
+		const grid = target instanceof Element ? findAlbumGrid() : null;
+		if (!grid?.contains(target)) return {};
 		const row = target.closest('[role="row"]');
 		if (!row || !grid.contains(row) || row.getAttribute("aria-rowindex") === "1") return { grid };
 		return { grid, row };
@@ -543,10 +666,6 @@
 	async function moveTracks(albumUri, uris, targetUri, after) {
 		if (!targetUri) return;
 		const tracks = await getAlbumTracks(albumUri);
-		if (tracks.length > MAX_TRACKS) {
-			notify(`Albums with more than ${MAX_TRACKS} tracks can't be reordered`, true);
-			return;
-		}
 		const original = tracks.map((t) => t.uri);
 		const entry = getEntry(albumUri);
 		const shown = entry ? reconcile(entry.order, original) : original.slice();
@@ -561,12 +680,12 @@
 
 		setOrder(albumUri, order, original);
 		syncResetButton();
-		if (playerApi.getState()?.context?.uri === albumUri) openFixWindow();
+		if (playerApi.getState?.()?.context?.uri === albumUri) openFixWindow();
+		refreshAlbumPage(albumUri, tracks);
 
 		const name = tracks.find((t) => t.uri === moving[0])?.name ?? "Track";
 		const where = `#${order.indexOf(moving[0]) + 1}`;
-		if (!refreshAlbumPage(albumUri, tracks)) notify("Saved. Reopen the album to see the new order.");
-		else notify(moving.length > 1 ? `Moved ${moving.length} tracks to ${where}` : `Moved "${name}" to ${where}`);
+		notify(moving.length > 1 ? `Moved ${moving.length} tracks to ${where}` : `Moved "${name}" to ${where}`);
 	}
 
 	async function resetOrder(albumUri) {
@@ -575,19 +694,19 @@
 		delete orders[albumUri];
 		saveOrders();
 		syncResetButton();
-		if (playerApi.getState()?.context?.uri === albumUri) {
+		if (playerApi.getState?.()?.context?.uri === albumUri) {
 			resetOverride = { albumUri, order: entry.original };
 			openFixWindow();
 		}
 		const tracks = await getAlbumTracks(albumUri).catch(() => null);
-		if (!tracks || !refreshAlbumPage(albumUri, tracks)) notify("Order reset. Reopen the album to see it.");
-		else notify("Back to the original track order");
+		if (tracks) refreshAlbumPage(albumUri, tracks);
+		notify("Back to the original track order");
 	}
 
 	// "Reset order" button in the album's action bar, shown while the album has a custom order.
 	function syncResetButton() {
 		const albumUri = currentAlbumUri();
-		const bar = albumUri ? document.querySelector('[data-testid="album-page"] [data-testid="action-bar-row"]') : null;
+		const bar = albumUri ? findFirst(ACTION_BAR_SELECTORS) : null;
 		let button = document.getElementById(RESET_ID);
 		if (!bar || !getEntry(albumUri)) {
 			button?.remove();
@@ -614,14 +733,12 @@
 		syncQueued = true;
 		requestAnimationFrame(() => {
 			syncQueued = false;
-			syncResetButton();
-			const albumUri = currentAlbumUri();
-			if (albumUri && (getEntry(albumUri) || touchedAlbums.has(albumUri))) {
-				try {
-					syncMountedTracklist(albumUri);
-				} catch (err) {
-					console.warn(LOG, err);
-				}
+			try {
+				syncResetButton();
+				const albumUri = currentAlbumUri();
+				if (albumUri && (getEntry(albumUri) || touchedAlbums.has(albumUri))) syncMountedTracklist(albumUri);
+			} catch (err) {
+				console.warn(LOG, err);
 			}
 		});
 	}).observe(document.body, { childList: true, subtree: true });
@@ -644,7 +761,7 @@
 		}
 	})(40);
 
-	Spicetify.Platform.History.listen((location) => {
+	Spicetify.Platform.History.listen?.((location) => {
 		const albumUri = albumUriFromPath(location?.pathname);
 		if (albumUri) getAlbumTracks(albumUri).catch(() => {});
 	});
@@ -654,22 +771,24 @@
 	// Playback: start albums at the custom first track, keep "Next up" in the custom order
 	// ---------------------------------------------------------------------------
 
-	const originalPlay = playerApi.play;
-	playerApi.play = function (context, origin, options) {
-		try {
-			options = adjustPlayOptions(context, options);
-		} catch (err) {
-			console.warn(LOG, err);
-		}
-		return originalPlay.call(playerApi, context, origin, options);
-	};
+	if (typeof playerApi.play === "function") {
+		const originalPlay = playerApi.play;
+		playerApi.play = function (context, origin, options) {
+			try {
+				options = adjustPlayOptions(context, options);
+			} catch (err) {
+				console.warn(LOG, err);
+			}
+			return originalPlay.call(playerApi, context, origin, options);
+		};
+	}
 
 	function adjustPlayOptions(context, options) {
 		const entry = getEntry(context?.uri);
 		if (!entry) return options;
 		openFixWindow();
 		const skipTo = options?.skipTo;
-		const shuffling = options?.shuffle ?? playerApi.getState()?.shuffle;
+		const shuffling = options?.shuffle ?? playerApi.getState?.()?.shuffle;
 		if (!skipTo || (!skipTo.uri && !skipTo.uid && !(skipTo.index > 0))) {
 			// "Play album" with no track picked: start at the custom first track.
 			if (shuffling) return options;
@@ -685,8 +804,8 @@
 		return options;
 	}
 
-	// Whenever an album with a custom order starts (or shuffle/repeat changes), Spotify fills
-	// "Next up" in the original order. For a short window afterwards, swap in the custom order.
+	// Whenever an album with a custom order starts, changes track, or shuffle/repeat changes, Spotify
+	// may fill "Next up" in the original order. For a short window afterwards, swap in the custom order.
 	let fixWindowUntil = 0;
 	let fixWindowId = 0;
 	let checkTimer = null;
@@ -707,6 +826,10 @@
 
 	function uriOf(track) {
 		return track?.contextTrack?.uri ?? track?.uri;
+	}
+
+	function contextEntry(uri) {
+		return { contextTrack: { uri, uid: "", metadata: { is_queued: "false" } }, removed: [], blocked: [], provider: "context" };
 	}
 
 	// Maps a queue entry to the album's track URI (handles relinked tracks).
@@ -731,12 +854,31 @@
 		return -1;
 	}
 
+	function readQueue() {
+		return playerApi._queue?._queue ?? Spicetify.Queue ?? null;
+	}
+
+	async function writeQueue(queue, nextTracks) {
+		const client = playerApi._queue?._client;
+		if (typeof client?.setQueue === "function") {
+			return client.setQueue({ nextTracks, prevTracks: queue.prevTracks ?? [], queueRevision: queue.queueRevision });
+		}
+		// Older Spotify builds: the player's queue endpoint.
+		if (typeof Spicetify.CosmosAsync?.put !== "function") return;
+		const plain = (t) => ({ uri: uriOf(t), uid: t.contextTrack?.uid ?? t.uid ?? "", provider: t.provider, metadata: t.contextTrack?.metadata ?? t.metadata ?? {} });
+		return Spicetify.CosmosAsync.put("sp://player/v2/main/queue", {
+			queue_revision: queue.queueRevision,
+			next_tracks: nextTracks.map(plain),
+			prev_tracks: (queue.prevTracks ?? []).map(plain),
+		});
+	}
+
 	async function checkQueue() {
 		if (Date.now() > fixWindowUntil) {
 			resetOverride = null;
 			return;
 		}
-		let state = playerApi.getState();
+		let state = playerApi.getState?.();
 		const albumUri = state?.context?.uri;
 		const entry = getEntry(albumUri);
 		const override = !entry && resetOverride?.albumUri === albumUri ? resetOverride : null;
@@ -752,10 +894,8 @@
 		const index = indexOfItem(order, state.item, tracks, albumUri);
 		if (index < 0) return;
 
-		const queueApi = playerApi._queue;
-		const queue = queueApi?._queue;
-		const client = queueApi?._client;
-		if (!queue || typeof client?.setQueue !== "function") return;
+		const queue = readQueue();
+		if (!Array.isArray(queue?.nextTracks)) return;
 		if (queue.track && albumUriOf(queue.track, known) !== order[index]) {
 			// The queue hasn't caught up with the player yet.
 			scheduleCheck(300);
@@ -763,13 +903,16 @@
 		}
 
 		const playable = new Set(tracks.filter((t) => t.playable).map((t) => t.uri));
+		const repeating = state.repeat === 1;
 		let desired = order.slice(index + 1);
-		if (state.repeat === 1) desired = desired.concat(order.slice(0, index + 1));
+		if (repeating) desired = desired.concat(order.slice(0, index + 1));
 		desired = desired.filter((uri) => playable.has(uri));
+		// "complete": everything left of the album fits in what we hand Spotify.
+		const complete = !repeating && desired.length <= QUEUE_WINDOW;
 
-		const next = queue.nextTracks ?? [];
+		const next = queue.nextTracks;
 		const actual = next.filter((t) => t.provider === "context" && uriOf(t) !== DELIMITER).map((t) => albumUriOf(t, known));
-		if (state.repeat === 1 ? startsWith(actual, desired) : arraysEqual(actual, desired)) {
+		if (complete ? arraysEqual(actual, desired) : startsWith(actual, desired.slice(0, QUEUE_CHECK))) {
 			if (override) resetOverride = null;
 			return;
 		}
@@ -781,41 +924,30 @@
 
 		const existing = new Map();
 		for (const t of next) if (t?.provider === "context") existing.set(albumUriOf(t, known), t);
-		// Spotify silently drops a track whose uid is already in the history/queue (e.g. a track that
-		// already played), so only reuse the album's uid when it's free; "" makes Spotify assign one.
-		const usedUids = new Set([...(queue.prevTracks ?? []), queue.track, ...next].map((t) => t?.contextTrack?.uid).filter(Boolean));
-		const uids = new Map(tracks.map((t) => [t.uri, t.uid]));
-		const contextTracks = desired.map((uri) => {
-			if (existing.has(uri)) return existing.get(uri);
-			const uid = uids.get(uri);
-			return {
-				contextTrack: { uri, uid: uid && !usedUids.has(uid) ? uid : "", metadata: { is_queued: "false" } },
-				removed: [],
-				blocked: [],
-				provider: "context",
-			};
-		});
+		// New entries get an empty uid so Spotify assigns one: it silently drops entries whose uid
+		// it doesn't expect (e.g. the album's own uid for a track outside the part it has loaded).
+		const contextTracks = desired.slice(0, QUEUE_WINDOW).map((uri) => existing.get(uri) ?? contextEntry(uri));
 		const queued = next.filter((t) => t.provider === "queue");
-		const rest = next.filter((t) => t.provider !== "queue" && t.provider !== "context" && uriOf(t) !== DELIMITER);
-
-		await client.setQueue({
-			nextTracks: [...queued, ...contextTracks, ...rest],
-			prevTracks: queue.prevTracks ?? [],
-			queueRevision: queue.queueRevision,
-		});
+		const others = next.filter((t) => t.provider !== "queue" && t.provider !== "context" && uriOf(t) !== DELIMITER);
+		// After the album's last track, let autoplay (or whatever Spotify lined up) follow. If Spotify
+		// went on with the album in its original order after our list, stop it with a delimiter.
+		let tail = [];
+		if (complete) {
+			const ranOn = actual.length > desired.length && startsWith(actual, desired);
+			tail = others.length ? others : ranOn ? [contextEntry(DELIMITER)] : [];
+		}
+		await writeQueue(queue, [...queued, ...contextTracks, ...tail]);
 	}
 
 	let last = {};
 	function onPlayerUpdate() {
-		const state = playerApi.getState();
+		const state = playerApi.getState?.();
 		if (!state) return;
 		const context = state.context?.uri ?? null;
 		const item = state.item?.uid || state.item?.uri || null;
-		if (getEntry(context)) {
-			if (context !== last.context) openFixWindow();
-			else if (last.shuffle && !state.shuffle) openFixWindow();
-			else if (last.repeat !== state.repeat) openFixWindow();
-			else if (state.repeat === 1 && item !== last.item) openFixWindow(4000);
+		if (getEntry(context) || resetOverride?.albumUri === context) {
+			if (context !== last.context || (last.shuffle && !state.shuffle) || last.repeat !== state.repeat) openFixWindow();
+			else if (item !== last.item) openFixWindow(4000);
 		}
 		last = { context, shuffle: state.shuffle, repeat: state.repeat, item };
 		if (Date.now() < fixWindowUntil) scheduleCheck();
@@ -829,5 +961,7 @@
 			if (Date.now() < fixWindowUntil) scheduleCheck();
 		});
 	}
+	// Older builds: Spicetify's own player events.
+	Spicetify.Player?.addEventListener?.("songchange", onPlayerUpdate);
 	onPlayerUpdate();
 })();
